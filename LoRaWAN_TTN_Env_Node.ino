@@ -8,12 +8,14 @@
  * Lex Bolkesteijn 
  * ------------------------------------------------------------------------ 
  * Filename : LoRaWAN_TTN_Env_Node.ino  
- * Version  : 1.0 (BETA)
+ * Version  : 1.1 (BETA)
  * ------------------------------------------------------------------------
  * Description : A low power BME280 based datalogger for the ThingsNetwork.
  *  with deepsleep support and variable interval
  * ------------------------------------------------------------------------
  * Revision : 
+ *  - 2018-jan-04 1.2 reset status detection (on brownout detect skip Tx on startup)
+ *  - 2017-dec-05 1.1 minor code updates
  *  - 2017-jul-17 1.0 first "beta"
  * ------------------------------------------------------------------------
  * Hardware used : 
@@ -94,10 +96,13 @@
 #define SHOW_DEBUGINFO  
 #define debugPrintLn(...) { if (debugSerial) debugSerial.println(__VA_ARGS__); }
 #define debugPrint(...) { if (debugSerial) debugSerial.print(__VA_ARGS__); } 
+#define debugFlush() { if (debugSerial) debugSerial.flush(); } 
 
-#define FASTINTERVAL    60    // 60 seconds (for testing)
-#define NORMALINTERVAL  900   // 15 minutes (normal)
+// When enable BROWNOUTDISABLED be sure that you have BOD fused.
+// #define BROWNOUTDISABLED
 
+#define NORMALINTERVAL  900   // 15 minutes (normal) 
+//#define NORMALINTERVAL  32   // 32 second (test highspeed) 
 
 // Restrict to channel0   if uncommented; otherwise all channels  (allways use SF7)
 // #define CHANNEL0
@@ -133,6 +138,7 @@ static const PROGMEM u1_t NWKSKEY[16] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x
 static const u1_t PROGMEM APPSKEY[16] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00A6, 0x00 }; // LoRaWAN AppSKey, application session key 
 static const u4_t DEVADDR = 0x00000000 ; // LoRaWAN end-device address (DevAddr)
 
+
 // These callbacks are only used in over-the-air activation, so they are
 // left empty here (we cannot leave them out completely unless
 // DISABLE_JOIN is set in config.h, otherwise the linker will complain).
@@ -150,7 +156,7 @@ static float humidity = 0.0;
 int interval = NORMALINTERVAL;  
 
 byte LMIC_transmitted = 0;
-byte LMIC_event_Timeout = 0;
+int LMIC_event_Timeout = 0;
 
 // Schedule TX every this many seconds (might become longer due to duty
 // cycle limitations).
@@ -217,7 +223,7 @@ void onEvent (ev_t ev)
             //debugPrintLn(F("EV_REJOIN_FAILED"));
             break;
         case EV_TXCOMPLETE:
-            debugPrintLn(F("EV_TXCOMPLETE"));
+            debugPrintLn(F("EV_TXC"));
             if (LMIC.txrxFlags & TXRX_ACK)
               debugPrintLn(F("R ACK")); // Received ack
             if (LMIC.dataLen) 
@@ -280,7 +286,7 @@ void do_send(osjob_t* j)
         debugPrintLn(pressure); 
         
         debugPrint(F("H="));
-         debugPrintLn(humidity); 
+        debugPrintLn(humidity); 
       
         debugPrint(F("B="));
         debugPrintLn(batt);
@@ -293,7 +299,7 @@ void do_send(osjob_t* j)
         int h = (int)(humidity);
 
         unsigned char mydata[6];
-        mydata[0] = batvalue;      
+        mydata[0] =  batvalue;      
         mydata[1] = h & 0xFF; 
         mydata[2] = t >> 8;
         mydata[3] = t & 0xFF;
@@ -305,21 +311,85 @@ void do_send(osjob_t* j)
     }
     // Next TX is scheduled after TX_COMPLETE event.
 }
+ 
 
+bool bootFromBrownOut = false;
 
-void setup() {
+// shows the bootstatus on serial output and set bootFromBrownout flag.
+void showBootStatus(uint8_t _mcusr)
+{
+  debugPrint(F("mcusr = "));
+  debugPrint(_mcusr, HEX);
+  debugPrint(F(" > "));
+  if (_mcusr & (1<<WDRF))
+  {
+    debugPrint(F(" WDR"));
+    _mcusr &= ~(1<<WDRF);
+  }
+  if (_mcusr & (1<<BORF))
+  {
+    debugPrint(F(" BOR"));
+    _mcusr &= ~(1<<BORF);
+    bootFromBrownOut = true;
+  }
+  if (_mcusr & (1<<EXTRF))
+  {
+    debugPrint(F(" EXTF"));
+    _mcusr &= ~(1<<EXTRF);
+  }
+  if (_mcusr & (1<<PORF))
+  {
+    debugPrint(F(" POR"));
+    _mcusr &= ~(1<<PORF);
+  }
+  if (_mcusr != 0x00)
+  {
+    // It should never enter here
+    debugPrint(F(" ??"));
+  }
+  debugPrintLn("");
+}
+
+void setup() 
+{
+    uint8_t mcusr = MCUSR;
+    MCUSR = 0;
+  
     Serial.begin(115200);
-    debugPrintLn(F("Starting"));
-    
-    if (!bme.begin()) 
-    {  
-        debugPrintLn(F("No valid bme280 sensor!"));
-        delay(1000);  // allow serial to send.
-        while (1) 
-        {
-           LowPower.powerDown(SLEEP_8S, ADC_OFF, BOD_OFF);   
+    debugPrintLn(F("Boot")); 
+
+    showBootStatus(mcusr);
+
+#if BROWNOUTDISABLED
+    // warning when using code below, disable brownout detection.
+    // For Arduino Pro Mini 8Mhz 3.3V
+    // MiniCore : ATMega328
+    // Clock : 8Mhz external
+    // Compiler LTO : Enabled
+    // Variant : 328P/328PA
+    // BOD : Disabled
+    int batt =  readVcc(); // do initial read, readVCC returns  mVolt  
+    debugPrint(F("B="));
+    debugPrintLn(batt); 
+    while (batt < 1800)
+    { 
+        debugPrintLn(F("low power !"));
+        LowPower.powerDown(SLEEP_8S, ADC_OFF, BOD_ON);  
+        batt = readVcc(); // readVCC returns  mVolt    
+    }  
+    // until here   
+#endif
+  
+    while (1)
+    {
+        if (bme.begin()) 
+        {  
+          break;
         }
-    } 
+        debugPrintLn(F("No valid bme280 sensor!"));
+        debugFlush();
+        LowPower.powerDown(SLEEP_8S, ADC_OFF, BOD_ON);  
+    }
   
     // LMIC init
     os_init();
@@ -396,42 +466,49 @@ void setup() {
     // Set data rate and transmit power for uplink (note: txpow seems to be ignored by the library)
     LMIC_setDrTxpow(DR_SF7,14); 
     debugPrintLn(F("S")); // Setup complete!"
-    delay(1000);  // allow serial to send.
+    debugFlush();   
 }
 
 void loop() 
 { 
-    // Start job
-    do_send(&sendjob);
-    // Wait for response of the queued message (check if message is send correctly)
-    os_runloop_once();
-    // Continue until message is transmitted correctly
-    //debugPrintLn("\tWaiting for transmittion\n"); 
-    debugPrintLn(F("W\n"));
-    while(LMIC_transmitted != 1) 
+    if (!bootFromBrownOut)
     {
+        // Start job
+        do_send(&sendjob);
+        // Wait for response of the queued message (check if message is send correctly)
         os_runloop_once();
-        // Add timeout counter when nothing happens:
-        LMIC_event_Timeout++;
-        delay(1000);
-        if (LMIC_event_Timeout >= 60) 
+        // Continue until message is transmitted correctly 
+        debugPrintLn(F("W")); // aiting for transmittion
+        LMIC_event_Timeout = 60*100;  // 60 * 100 times 10mSec = 60 seconds
+        while(LMIC_transmitted != 1) 
         {
-            // Timeout when there's no "EV_TXCOMPLETE" event after 60 seconds
-            debugPrintLn(F("\tETimeout, msg not tx\n"));
-            break;
-        } 
+            os_runloop_once();
+            // Add timeout counter when nothing happens: 
+            delay(10);
+            if (LMIC_event_Timeout-- == 0) 
+            {
+                // Timeout when there's no "EV_TXCOMPLETE" event after 60 seconds
+                debugPrintLn(F("ETO, msg not tx"));
+                break;
+            } 
+        }
     }
+    else
+    {
+       debugPrintLn("X");
+    }
+    bootFromBrownOut = false;
 
     LMIC_transmitted = 0;
     LMIC_event_Timeout = 0;
-    //debugPrintLn(F("Going to sleep."));
-    delay(1000);  // allow serial to send.
+    debugPrintLn(F("G"));
+    debugFlush();
     
     for (int i = 0; i < interval; i++)
     {  
-          i +=7 ; // no normal 1 second run but 8 second loops m.      
-          // Enter power down state for 8 s with ADC and BOD module disabled
-          LowPower.powerDown(SLEEP_8S, ADC_OFF, BOD_OFF);   
+          i +=8 ; // no normal 1 second run but 8 second loops m.      
+          // Enter power down state for 8 s with ADC and BOD module enabled
+          LowPower.powerDown(SLEEP_8S, ADC_OFF, BOD_ON);   
     }  
-    //debugPrintLn("---");
+    debugPrintLn("-");
 }
